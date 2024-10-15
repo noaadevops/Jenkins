@@ -1,0 +1,237 @@
+---
+- name: Remove existing Java installations
+  ansible.builtin.apt:
+    name:
+      - openjdk-*-jdk
+      - openjdk-*-jre
+    state: absent
+    purge: yes
+    update_cache: yes
+
+- name: Install lsof package
+  ansible.builtin.apt:
+    name: lsof
+    state: present
+
+- name: Check for any service using port 8080
+  ansible.builtin.shell:
+    cmd: lsof -i :8080 || echo "No service using port 8080"
+  register: port_check
+  ignore_errors: yes
+
+- name: Stop any service using port 8080
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  with_items: "{{ port_check.stdout_lines | select('search', 'LISTEN') | map('regex_replace', '^([a-zA-Z0-9_-]+).*', '\\1') | list }}"
+  when: port_check.stdout_lines | length > 0    
+
+- name: Update the apt package index
+  ansible.builtin.apt:
+    update_cache: yes
+
+- name: Install Java
+  ansible.builtin.apt:
+    name:
+      - openjdk-17-jdk
+    state: present
+    update_cache: yes
+
+- name: Find the installed Java path
+  ansible.builtin.find:
+    paths: /usr/lib/jvm/
+    patterns: 'java-17-openjdk-*'
+    recurse: yes
+  register: java_paths
+
+- name: Set JAVA_HOME environment variable
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    line: "JAVA_HOME={{ item.path }}"
+    create: yes
+    state: present
+  loop: "{{ java_paths.files }}"
+  when: item.path.endswith('/java-17-openjdk-amd64')
+
+- name: Ensure JAVA_HOME is available in the current session
+  ansible.builtin.shell: |
+    source /etc/environment
+    echo $JAVA_HOME
+  register: java_home_check
+  changed_when: false
+
+- name: Display JAVA_HOME value
+  ansible.builtin.debug:
+    var: java_home_check.stdout_lines
+
+- name: Verify the Installed Java version
+  ansible.builtin.command:
+    cmd: "{{ lookup('env', 'JAVA_HOME') }}/bin/java -version"
+  register: java_version
+  changed_when: false
+  failed_when: java_version.rc != 0
+
+- name: Display the Installed Java version
+  ansible.builtin.debug:
+    var: java_version.stderr_lines
+
+- name: Download Jenkins GPG key
+  ansible.builtin.get_url:
+    url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+    dest: /usr/share/keyrings/jenkins-keyring.asc
+
+- name: Add Jenkins repository
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list.d/jenkins.list
+    line: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+    create: yes
+    state: present
+
+- name: Update the apt package index
+  ansible.builtin.apt:
+    update_cache: yes
+
+- name: Install Jenkins
+  ansible.builtin.apt:
+    name: jenkins
+    state: present
+  register: jenkins_install_result
+
+- name: Jenkins installation errors
+  ansible.builtin.fail:
+    msg: "Jenkins installation failed. Please check logs and resolve any issues."
+  when: jenkins_install_result.failed
+
+- name: Set JAVA_HOME in Jenkins init script
+  ansible.builtin.lineinfile:
+    path: /etc/init.d/jenkins
+    line: 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64'
+    create: yes
+    state: present
+    insertafter: '### BEGIN INIT INFO'
+
+- name: Restart Jenkins service
+  ansible.builtin.service:
+    name: jenkins
+    state: restarted
+  register: jenkins_service_result
+
+- name: Jenkins service restart errors
+  ansible.builtin.fail:
+    msg: "Jenkins service restart failed. Please check logs and resolve any issues."
+  when: jenkins_service_result.failed
+
+- name: Check Jenkins service status
+  ansible.builtin.command:
+    cmd: systemctl status jenkins.service
+  register: jenkins_status_check
+
+- name: Display Jenkins service status
+  ansible.builtin.debug:
+    var: jenkins_status_check.stdout_lines
+
+- name: Check Jenkins service logs
+  ansible.builtin.command:
+    cmd: journalctl -xeu jenkins.service
+  register: jenkins_logs
+
+- name: Display Jenkins service logs
+  ansible.builtin.debug:
+    var: jenkins_logs.stdout_lines
+
+- name: Get Jenkins password
+  ansible.builtin.command:
+    cmd: cat /var/lib/jenkins/secrets/initialAdminPassword
+  register: jenkins_initial_password
+
+- name: Jenkins password read errors
+  ansible.builtin.fail:
+    msg: "Failed to read Jenkins initial admin password"
+  when: jenkins_initial_password.failed
+
+- name: Display Jenkins password
+  ansible.builtin.debug:
+    var: jenkins_initial_password.stdout
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+    state: latest
+
+- name: Add the GPG signing key for the Docker repository
+  ansible.builtin.apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add the Docker APT repository to the sources.list.d directory
+  ansible.builtin.apt_repository:
+    repo: deb https://download.docker.com/linux/ubuntu jammy stable
+    state: present
+    filename: docker
+  notify: Update the apt package index
+
+- name: Get Docker CE package policy
+  ansible.builtin.command:
+    cmd: apt-cache policy docker-ce
+  register: docker_ce_policy
+
+- name: Display info about docker-ce
+  ansible.builtin.debug:
+    var: docker_ce_policy.stdout_lines
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name: docker-ce
+    state: latest
+  register: docker_install_result
+
+- name: Docker installation errors                              
+  ansible.builtin.fail:                                         
+    msg: "Docker installation failed. Please check logs and resolve any issues."
+  when: docker_install_result.failed
+
+- name: Verify docker status
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: yes
+  register: docker_service_result
+
+- name: Docker service start errors
+  ansible.builtin.fail:
+    msg: "Docker service start failed. Please check logs and resolve any issues."
+  when: docker_service_result.failed
+
+- name: Check Docker version
+  ansible.builtin.command:
+    cmd: docker --version
+  register: docker_version
+
+- name: Display Docker version
+  ansible.builtin.debug:
+    var: docker_version.stdout_lines  
+
+- name: Add user to Docker group
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+    state: present
+
+- name: Get information about the user's groups
+  ansible.builtin.shell: id -nG {{ ansible_user }}
+  register: user_groups_info
+
+- name: Display user groups
+  ansible.builtin.debug:
+    var: user_groups_info.stdout_lines
+
+- name: Verify that user is in the Docker group
+  ansible.builtin.debug:
+    msg: "User is in the Docker group"
+  when: "'docker' in user_groups_info.stdout.split()"
